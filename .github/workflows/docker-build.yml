@@ -137,7 +137,8 @@ jobs:
           BUILD_ARGS=${{ matrix.build_args }}
 
           # Resource allocations appropriate for GitHub runners
-          DOCKER_MEMORY=7g
+          # Increased to 10g for FULL profile which has all features enabled
+          DOCKER_MEMORY=10g
           DOCKER_CPUS=2
 
           # User ID mapping - use the runner's UID/GID
