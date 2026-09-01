@@ -36,3 +36,12 @@ docker/.env
 
 # Claude working directory
 zclaude/
+
+# AI tooling local state
+.kiro/
+.kirox/
+.kilocode/
+.opencode/
+.opencode*
+kiro/
+opencode/

@@ -1,12 +1,21 @@
 name: Docker Build
 
+# Remote-only build — size is not critical, so we default to the full profile
+# which includes all network + disk partitioning capabilities:
+# ZFS, Btrfs, recovery, network, crypto, TUI, advanced FS (ntfs-3g/xfsprogs/gptfdisk/exfatprogs/f2fs-tools),
+# disk diag (smartmontools/hdparm/nvme-cli/dmidecode/lshw), network diag (ethtool/nmap/wireguard/openvpn),
+# system tools, data recovery, boot repair, editors, security.
+# Defined in build/86_build_profiles.sh:set_full_profile()
+
 on:
   push:
-    # Only build on tags, not branches
-    branches-ignore: ['**']  # Explicitly ignore all branches
+    branches: [master, main]
     tags:
-      - 'build-*'  # Tags for builds only (no release)
-      - 'v*'       # Tags for builds with releases (e.g., v1.0.0)
+      - 'build-*'  # build without release
+      - 'v*'       # build with release
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   pull_request:
     branches: [master, main]
     paths-ignore:
@@ -15,166 +24,162 @@ on:
   workflow_dispatch:
     inputs:
       build_type:
-        description: 'Build type (minimal, standard, full)'
+        description: 'Build profile — full is recommended (network + partitioning)'
         required: true
-        default: 'standard'
+        default: 'full'
         type: choice
         options:
-          - minimal
-          - standard
           - full
+          - standard
+          - minimal
+      compression:
+        description: 'EFI compression'
+        required: true
+        default: 'upx'
+        type: choice
+        options:
+          - upx
+          - none
+          - xz
+          - zstd
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # Job to determine which builds to run based on trigger type
   setup:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       release: ${{ steps.check-release.outputs.should_release }}
+      build_args: ${{ steps.set-matrix.outputs.build_args }}
     steps:
       - id: check-release
         run: |
-          # Check if this is a release tag (starts with 'v')
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             echo "should_release=true" >> $GITHUB_OUTPUT
           else
             echo "should_release=false" >> $GITHUB_OUTPUT
           fi
-      
+
       - id: set-matrix
         run: |
+          # Default for remote builds: full (size not critical, all tools).
+          # Build args are propagated to docker/entrypoint.sh -> build/84_build_core.sh:parse_build_args()
+          # and build/86_build_profiles.sh:apply_build_profile() which sets BUILD_TYPE for
+          # the EFI filename in build/84_build_core.sh:create_efi() (OneFileLinux-${BUILD_TYPE}.efi).
+
+          # Resolve profile: workflow_dispatch input > tag/push default (full)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # For manual triggers, only build the selected type
-            echo "matrix={\"include\":[{\"name\":\"${{ github.event.inputs.build_type }}\",\"build_args\":\"--profile=${{ github.event.inputs.build_type }} --compression-tool=upx\"}]}" >> $GITHUB_OUTPUT
+            PROFILE="${{ github.event.inputs.build_type }}"
+            COMP="${{ github.event.inputs.compression }}"
           else
-            # For automatic triggers, build all types with UPX compression
-            echo "matrix={\"include\":[{\"name\":\"minimal\",\"build_args\":\"--profile=minimal --compression-tool=upx\"},{\"name\":\"standard\",\"build_args\":\"--profile=standard --compression-tool=upx\"},{\"name\":\"full\",\"build_args\":\"--profile=full --compression-tool=upx\"}]}" >> $GITHUB_OUTPUT
+            PROFILE="full"
+            COMP="upx"
           fi
 
-  # Build job using Docker with the same setup as local builds
+          if [ "$COMP" = "none" ]; then
+            ARGS="--profile=$PROFILE --without-compression"
+          else
+            ARGS="--profile=$PROFILE --compression-tool=$COMP"
+          fi
+
+          echo "build_args=$ARGS" >> $GITHUB_OUTPUT
+
+          # Single-item matrix keeps artifact naming simple (OneFileLinux-full.efi)
+          # For size-not-critical use-case we avoid building all three profiles in parallel
+          # (each needs ~10g/2 CPUs — parallel matrix caused OOM on GitHub runners).
+          echo "matrix={\"include\":[{\"name\":\"$PROFILE\",\"build_args\":\"$ARGS\"}]}" >> $GITHUB_OUTPUT
+          echo "Selected: $ARGS"
+
   build:
     needs: setup
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     strategy:
-      matrix: ${{fromJson(needs.setup.outputs.matrix)}}
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
       fail-fast: false
-
     name: Build OneFileLinux (${{ matrix.name }})
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Free disk space (kernel builds need ~25GB)
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h
+
       - name: Set up build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential gcc g++ make autoconf automake libtool libelf-dev upx-ucl unzip zstd xz-utils ccache uuid-dev libuuid1 libblkid-dev libtirpc-dev
-          
-          # Verify Docker is installed and running (GitHub Actions has Docker pre-installed)
           docker --version
-          
-          # Set up Docker Compose (either install it or create wrapper for docker compose plugin)
           if ! command -v docker-compose &> /dev/null; then
-            echo "docker-compose command not found, setting up alternatives..."
-            
-            # First try to use docker compose plugin if available
             if docker compose version &> /dev/null; then
-              echo "Docker Compose plugin is available, creating wrapper script"
               echo '#!/bin/bash
-              docker compose "$@"' > /tmp/docker-compose
+          docker compose "$@"' > /tmp/docker-compose
               chmod +x /tmp/docker-compose
               sudo mv /tmp/docker-compose /usr/local/bin/docker-compose
             else
-              # If plugin not available, install docker-compose binary
-              echo "Installing docker-compose from GitHub releases"
               sudo curl -L "https://github.com/docker/compose/releases/download/v2.24.6/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
               sudo chmod +x /usr/local/bin/docker-compose
             fi
           fi
-          
-          # Verify docker-compose is now available
-          docker-compose --version || echo "Warning: docker-compose not available, will use docker compose plugin directly"
-
-          # Create output directories with appropriate permissions and ensure docker can write to them
+          docker-compose --version
           mkdir -p build/output output
           sudo chown -R $(id -u):$(id -g) build output
           sudo chmod -R 777 build output
-          
-          # Create a .build_progress file with correct permissions if it doesn't exist
           touch build/.build_progress
           chmod 666 build/.build_progress
-
-          # Make all scripts executable
           chmod -R +x build/*.sh docker/*.sh
           find build/tools -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
 
       - name: Cache Alpine kernel configs
         uses: actions/cache@v4
         with:
-          path: build/zfiles/kernel-configs
+          path: build/kernel-configs
           key: alpine-kernel-config-${{ hashFiles('build/80_common.sh') }}
-          restore-keys: |
-            alpine-kernel-config-
+          restore-keys: alpine-kernel-config-
 
       - name: Set up ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ runner.os }}-${{ matrix.name }}-${{ github.sha }}
+          key: ccache-${{ runner.os }}-${{ matrix.name }}-${{ hashFiles('build/84_build_core.sh', 'build/86_build_profiles.sh') }}
           restore-keys: |
             ccache-${{ runner.os }}-${{ matrix.name }}-
             ccache-${{ runner.os }}-
 
-      # Create custom env file for GitHub Actions using the same docker-compose setup as local
       - name: Configure build environment
         run: |
-          # Create .env file with GitHub-specific settings
           cat > docker/.env << EOF
-          # GitHub Actions build environment
-          # Generated at $(date)
-
-          # Build arguments from matrix
+          # GitHub Actions — remote build, size not critical
+          # Generated at $(date -u)
           BUILD_ARGS=${{ matrix.build_args }}
-
-          # Resource allocations appropriate for GitHub runners
-          # Increased to 10g for FULL profile which has all features enabled
           DOCKER_MEMORY=10g
           DOCKER_CPUS=2
-
-          # User ID mapping - use the runner's UID/GID
           HOST_UID=$(id -u)
           HOST_GID=$(id -g)
-
-          # GitHub-specific settings
           GITHUB_ACTIONS=true
-
-          # Run as root to avoid permission issues
           RUN_AS_ROOT=true
           RUN_AS_USER=root
-          
-          # Use default password 'onefilelinux' instead of generating a random one
           GENERATE_RANDOM_PASSWORD=false
           ROOT_PASSWORD=onefilelinux
-          
-          # Debug settings
           DEBUG_FEATURE_FLAGS=true
           EOF
-          
-          # Also prepare build directory for Docker entrypoint
+          cat docker/.env
           mkdir -p build/.onefilelinux
-          touch build/.onefilelinux/host_uid_gid
           echo "$(id -u):$(id -g)" > build/.onefilelinux/host_uid_gid
           chmod 666 build/.onefilelinux/host_uid_gid
-
-          # Create ccache directory with proper permissions
           mkdir -p ~/.ccache
           sudo chmod -R 777 ~/.ccache
+          mkdir -p build/kernel-configs/features
+          chmod -R 777 build/kernel-configs 2>/dev/null || true
 
-          # Copy any existing kernel configs to the expected location
-          mkdir -p build/zfiles/kernel-configs/features
-          chmod -R 777 build/zfiles/kernel-configs
-
-      # Run the build using the same docker-compose setup as local builds
       - name: Build OneFileLinux using Docker
         env:
           BUILD_ARGS: ${{ matrix.build_args }}
@@ -182,106 +187,59 @@ jobs:
           ROOT_PASSWORD: "onefilelinux"
         run: |
           cd docker
-
-          # Show configuration
           echo "Building with arguments: $BUILD_ARGS"
           cat .env
-
-          # Set environment variables for Docker
           export HOST_UID=$(id -u)
           export HOST_GID=$(id -g)
-          echo "Setting HOST_UID=$HOST_UID and HOST_GID=$HOST_GID in environment"
-          
-          # Use the local docker-compose setup for builds
-          # Try both docker-compose and docker compose commands
           if command -v docker-compose &> /dev/null; then
-            echo "Using docker-compose command"
             docker-compose up --build
-            COMPOSE_EXIT_CODE=$?
+            EC=$?
           else
-            echo "Using docker compose plugin directly"
             docker compose up --build
-            COMPOSE_EXIT_CODE=$?
+            EC=$?
           fi
-
-          # Check the exit code
-          if [ $COMPOSE_EXIT_CODE -ne 0 ]; then
-            echo "Docker build failed with exit code: $COMPOSE_EXIT_CODE"
-            if command -v docker-compose &> /dev/null; then
-              docker-compose logs
-            else
-              docker compose logs
-            fi
-            exit 1
+          if [ $EC -ne 0 ]; then
+            echo "Docker build failed: $EC"
+            docker compose logs 2>/dev/null || docker-compose logs 2>/dev/null || true
+            exit $EC
           fi
-
-          # Show output directory
           echo "Build output files:"
-          ls -la ../output/
-
-          # If we need to apply any GitHub-specific fixes to output files, do it here
+          ls -lh ../output/ || true
+          ls -lh ../build/build_timing.log || true
+          cat ../build/build_timing.log 2>/dev/null || true
 
       - name: Check for build artifacts
         id: check_files
         run: |
-          # Find all EFI files in the output directory
           echo "Searching for build artifacts in ./output/"
           ls -la ./output/ || true
-          
-          # Find EFI files (including those with custom names)
           EFI_FILES=$(find ./output/ -name "*.efi" | sort)
-          
-          if [ -n "$EFI_FILES" ]; then
-            echo "efi_file=true" >> $GITHUB_OUTPUT
-            
-            # Check if we have a profile-specific EFI first
-            PROFILE_EFI="./output/OneFileLinux-${{ matrix.name }}.efi"
-            GENERIC_EFI="./output/OneFileLinux.efi"
-            
-            # Look for custom profile names (contain 'custom' in the name)
-            CUSTOM_EFI=$(echo "$EFI_FILES" | grep -i "custom" | head -1)
-            
-            # Prioritize files in this order: Profile-specific > Custom > Generic
-            if [ -f "$PROFILE_EFI" ]; then
-              PRIMARY_EFI="$PROFILE_EFI"
-              echo "efi_path=$PROFILE_EFI" >> $GITHUB_OUTPUT
-              echo "Found profile-specific EFI file: $PROFILE_EFI"
-            elif [ -n "$CUSTOM_EFI" ] && [ -f "$CUSTOM_EFI" ]; then
-              PRIMARY_EFI="$CUSTOM_EFI"
-              echo "efi_path=$CUSTOM_EFI" >> $GITHUB_OUTPUT
-              echo "Found custom profile EFI file: $CUSTOM_EFI"
-            elif [ -f "$GENERIC_EFI" ]; then
-              PRIMARY_EFI="$GENERIC_EFI"
-              echo "efi_path=$GENERIC_EFI" >> $GITHUB_OUTPUT
-              echo "Found generic EFI file: $GENERIC_EFI"
-              
-              # Copy it to the profile-specific name for consistent artifacts
-              cp "$GENERIC_EFI" "$PROFILE_EFI"
-              echo "Copied to: $PROFILE_EFI"
-            else
-              # If none of the expected names are found, use the first EFI file
-              PRIMARY_EFI=$(echo "$EFI_FILES" | head -1)
-              echo "efi_path=$PRIMARY_EFI" >> $GITHUB_OUTPUT
-              echo "Found alternative EFI file: $PRIMARY_EFI"
-            fi
-            
-            # Show information about the primary EFI file
-            du -h "$PRIMARY_EFI"
-            
-            # List all EFI files found (for comprehensive logging)
-            echo "All EFI files found:"
-            for efi in $EFI_FILES; do
-              file_size=$(du -h "$efi" | cut -f1)
-              echo "- $efi (Size: $file_size)"
-            done
-          else
+          if [ -z "$EFI_FILES" ]; then
             echo "efi_file=false" >> $GITHUB_OUTPUT
             echo "Build failed to produce any EFI file"
-            ls -la ./output/
+            if [ -f ./build/build_timing.log ]; then cat ./build/build_timing.log; fi
+            docker compose logs 2>/dev/null || docker-compose logs 2>/dev/null || true
             exit 1
           fi
-
-          # Display timing data if available
+          echo "efi_file=true" >> $GITHUB_OUTPUT
+          PROFILE_EFI="./output/OneFileLinux-${{ matrix.name }}.efi"
+          GENERIC_EFI="./output/OneFileLinux.efi"
+          # create_efi() in build/84_build_core.sh:398 names file as OneFileLinux-${BUILD_TYPE}.efi
+          # and symlinks OneFileLinux.efi -> profile file. Handle both.
+          if [ -f "$PROFILE_EFI" ]; then
+            PRIMARY_EFI="$PROFILE_EFI"
+            echo "efi_path=$PROFILE_EFI" >> $GITHUB_OUTPUT
+          elif [ -f "$GENERIC_EFI" ]; then
+            PRIMARY_EFI="$GENERIC_EFI"
+            echo "efi_path=$GENERIC_EFI" >> $GITHUB_OUTPUT
+            cp "$GENERIC_EFI" "$PROFILE_EFI" 2>/dev/null || true
+          else
+            PRIMARY_EFI=$(echo "$EFI_FILES" | head -1)
+            echo "efi_path=$PRIMARY_EFI" >> $GITHUB_OUTPUT
+          fi
+          du -h "$PRIMARY_EFI"
+          echo "All EFI files found:"
+          for efi in $EFI_FILES; do du -h "$efi"; done
           if [ -f "./build/build_timing.log" ]; then
             echo "Build Timing Data:"
             cat ./build/build_timing.log
@@ -292,9 +250,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: OneFileLinux-${{ matrix.name }}
-          # Upload all EFI files to ensure custom profiles are included
-          path: |
-            ./output/*.efi
+          path: ./output/*.efi
           if-no-files-found: error
 
       - name: Upload build timing log
@@ -305,11 +261,9 @@ jobs:
           path: ./build/build_timing.log
           if-no-files-found: warn
 
-  # Release job - now conditional on the tag pattern only
   release:
     name: Package and Release
     needs: [setup, build]
-    # Only run release job for 'v*' tags
     if: needs.setup.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -321,60 +275,27 @@ jobs:
       - name: Create release package
         run: |
           mkdir -p release
-
-          # Copy all EFI files from each artifact directory to the release directory
           echo "Examining artifact directories:"
           ls -la ./artifacts/
-          
-          # Loop through all artifact directories
           for artifact_dir in ./artifacts/OneFileLinux-*/; do
-            if [ -d "$artifact_dir" ]; then
-              echo "Processing artifact directory: $artifact_dir"
-              ls -la "$artifact_dir"
-              
-              # Get the artifact name (last part of the directory path)
-              artifact_name=$(basename "$artifact_dir")
-              
-              # Find all EFI files in the artifact directory
-              for efi_file in "$artifact_dir"/*.efi; do
-                if [ -f "$efi_file" ]; then
-                  # Use the original filename if it's profile-specific (contains a hyphen)
-                  # Otherwise rename it based on the artifact name
-                  efi_basename=$(basename "$efi_file")
-                  if [[ "$efi_basename" == *"-"* ]]; then
-                    # Already has a profile in the name, keep it
-                    cp "$efi_file" "./release/"
-                    echo "Copied $efi_file to ./release/$efi_basename (keeping original name)"
-                  else
-                    # Standard OneFileLinux.efi file, rename based on artifact
-                    profile_name=${artifact_name#OneFileLinux-}
-                    cp "$efi_file" "./release/OneFileLinux-$profile_name.efi"
-                    echo "Copied $efi_file to ./release/OneFileLinux-$profile_name.efi"
-                  fi
-                fi
-              done
-            fi
+            [ -d "$artifact_dir" ] || continue
+            echo "Processing $artifact_dir"
+            ls -la "$artifact_dir"
+            artifact_name=$(basename "$artifact_dir")
+            for efi_file in "$artifact_dir"/*.efi; do
+              [ -f "$efi_file" ] || continue
+              efi_basename=$(basename "$efi_file")
+              if [[ "$efi_basename" == *"-"* ]]; then
+                cp "$efi_file" "./release/"
+                echo "Copied $efi_file -> ./release/$efi_basename"
+              else
+                profile_name=${artifact_name#OneFileLinux-}
+                cp "$efi_file" "./release/OneFileLinux-$profile_name.efi"
+                echo "Copied $efi_file -> ./release/OneFileLinux-$profile_name.efi"
+              fi
+            done
           done
-          
-          # Handle special case for custom builds that might have a different naming pattern
-          for artifact_dir in ./artifacts/OneFileLinux-custom*/; do
-            if [ -d "$artifact_dir" ]; then
-              echo "Processing custom artifact directory: $artifact_dir"
-              # Copy all EFI files as-is
-              for efi_file in "$artifact_dir"/*.efi; do
-                if [ -f "$efi_file" ]; then
-                  cp "$efi_file" "./release/"
-                  echo "Copied custom build file: $efi_file"
-                fi
-              done
-            fi
-          done
-
-          # Check what EFI files we have
-          echo "Release files:"
-          ls -la ./release/
-
-          # Create zip with all EFI files
+          ls -lh ./release/
           cd release
           zip -r OneFileLinux-release.zip *.efi
 
@@ -384,7 +305,6 @@ jobs:
           name: OneFileLinux-release
           path: ./release/OneFileLinux-release.zip
 
-      # Create GitHub Release for v* tags
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
